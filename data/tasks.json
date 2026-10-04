@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "users": [
+    { "id": "roman", "name": "Роман", "admin": true },
+    { "id": "ivan", "name": "Иван" },
+    { "id": "alexey", "name": "Алексей" }
+  ],
+  "themes": [
+    { "id": "seo", "name": "SEO и сайт защита-про.рф", "color": "#d12c2c", "owner": null },
+    { "id": "sales", "name": "Продажи и клиенты", "color": "#2f6fed", "owner": null },
+    { "id": "docs", "name": "Договоры и документы", "color": "#1f9d6b", "owner": null }
+  ],
+  "tasks": []
+}
