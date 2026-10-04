@@ -122,6 +122,7 @@ function readStatic() {
 function readLatest() {
   if (!S.token || S.keyProblem) return readStatic();
   return fetch(contentsUrl() + '?ref=' + CFG.branch + '&t=' + Date.now(), { headers: ghHeaders(), cache: 'no-store' }).then(function (r) {
+    if (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0') throw new Error('Лимит запросов GitHub, подождите минуту.');
     if (r.status === 401 || r.status === 403 || r.status === 404) {
       S.keyProblem = 'Ключ не подходит или истек. Введите новый ключ.';
       S.canWrite = false;
@@ -165,7 +166,9 @@ function commit(fn, msg) {
           });
         }
         if ((r.status === 409 || r.status === 422) && ++attempt < 4) return go();
-        if (r.status === 401 || r.status === 403) { S.keyProblem = 'Ключ не подходит или истек. Введите новый ключ.'; S.canWrite = false; }
+        if (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0') throw new Error('Лимит запросов GitHub, подождите минуту.');
+        if (r.status === 401) { S.keyProblem = 'Ключ не подходит или истек. Введите новый ключ.'; S.canWrite = false; }
+        if (r.status === 403) { S.keyProblem = 'У ключа нет права записи. Нужно право Contents: Read and write.'; S.canWrite = false; }
         return r.text().then(function (t) {
           var m = ''; try { m = JSON.parse(t).message; } catch (e) { m = 'ошибка ' + r.status; }
           throw new Error(m);
@@ -186,7 +189,7 @@ function mutate(fn, msg) {
   var job = queue.then(function () { return commit(fn, who + ': ' + msg); });
   queue = job.catch(function () { /* цепочку не рвем */ });
   return job.then(function () { return true; }, function (e) {
-    toast('Не удалось сохранить: ' + e.message, 'err');
+    toast('Не удалось сохранить: ' + errText(e), 'err');
     return false;
   }).then(function (ok) {
     S.saving--;
@@ -203,11 +206,13 @@ function refresh(manual) {
     S.lastSync = new Date();
     render();
   }).catch(function (e) {
-    S.error = e.message;
+    S.error = errText(e);
     setSync();
-    if (!S.data) fatal(e.message);
+    if (!S.data) fatal(S.error);
   });
 }
+
+function errText(e) { return e instanceof TypeError ? 'нет связи с GitHub' : e.message; }
 
 function fatal(msg) {
   $('board').replaceChildren(h('div', { class: 'empty' }, 'Не удалось загрузить задачи. ' + msg));
@@ -306,7 +311,7 @@ function renderToolbarState() {
 
 function visible(t) {
   var f = S.filter;
-  if (f.who === 'me' && t.assignee !== S.me) return false;
+  if (f.who === 'me' && t.assignee !== S.me && t.author !== S.me) return false;
   if (f.status && t.status !== f.status) return false;
   if (f.exec === '_none' && t.assignee) return false;
   if (f.exec && f.exec !== '_none' && t.assignee !== f.exec) return false;
@@ -566,7 +571,7 @@ function openThemes() {
         opt('', 'Исполнитель не назначен'), d.users.map(function (u) { return opt(u.id, u.name); }));
       owner.value = r.owner;
       var has = r.isNew ? 0 : taskCount(r.id);
-      var del = h('button', { class: 'xbtn', type: 'button', title: has ? 'Сначала удалите или перенесите задачи этой тематики' : 'Удалить тематику', 'aria-label': 'Удалить тематику', disabled: has > 0,
+      var del = h('button', { class: 'xbtn', type: 'button', title: has ? 'Сначала удалите задачи этой тематики (' + has + ', включая готовые)' : 'Удалить тематику', 'aria-label': 'Удалить тематику', disabled: has > 0,
         onclick: function () { if (r.isNew) rows.splice(rows.indexOf(r), 1); else r.del = !r.del; draw(); } }, r.del ? '↺' : '×');
       var rowEl = h('div', { class: 'trow' + (r.del ? ' gone' : '') }, color, name, owner, del);
       if (!r.isNew && r.owner !== r.origOwner && openCount(r.id) > 0 && !r.del) {
@@ -624,7 +629,9 @@ function openThemes() {
 
 function init() {
   dlg = $('dlg');
-  dlg.addEventListener('click', function (e) { if (e.target === dlg && !dlgLocked) closeDlg(); });
+  var downOnBackdrop = false;
+  dlg.addEventListener('mousedown', function (e) { downOnBackdrop = e.target === dlg; });
+  dlg.addEventListener('click', function (e) { if (e.target === dlg && downOnBackdrop && !dlgLocked) closeDlg(); });
   dlg.addEventListener('cancel', function (e) { if (dlgLocked) e.preventDefault(); });
   dlg.addEventListener('close', function () { if (S.data && !meUser()) openWho(); });
   $('keyBtn').addEventListener('click', openKey);
