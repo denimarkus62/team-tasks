@@ -3,7 +3,9 @@
   "users": [
     { "id": "roman", "name": "Роман", "admin": true },
     { "id": "ivan", "name": "Иван" },
-    { "id": "alexey", "name": "Алексей" }
+    { "id": "alexey", "name": "Алексей" },
+    { "id": "anton", "name": "Антон" },
+    { "id": "sergey", "name": "Сергей" }
   ],
   "themes": [
     { "id": "seo", "name": "SEO и сайт защита-про.рф", "color": "#d12c2c", "owner": null },
