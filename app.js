@@ -8,6 +8,8 @@ var LS_ME = 'tasks_me';
 var STATUSES = [['new', 'Новая'], ['progress', 'В работе'], ['review', 'На проверке'], ['done', 'Готово']];
 var COLORS = ['#d12c2c', '#2f6fed', '#1f9d6b', '#d98a00', '#8a4fd6', '#00859b', '#6b7280'];
 var POLL_MS = 60000;
+var FILES_DIR = 'files';
+var MAX_FILE = 20 * 1024 * 1024;
 
 var S = {
   data: null,
@@ -16,6 +18,7 @@ var S = {
   canWrite: false,
   keyProblem: '',
   saving: 0,
+  uploading: 0,
   error: '',
   lastSync: null,
   filter: { who: 'all', status: '', exec: '', q: '' },
@@ -93,7 +96,10 @@ function normalize(d) {
   d.users = Array.isArray(d.users) ? d.users : [];
   d.themes = Array.isArray(d.themes) ? d.themes : [];
   d.tasks = Array.isArray(d.tasks) ? d.tasks : [];
-  d.tasks.forEach(function (t) { if (!Array.isArray(t.comments)) t.comments = []; });
+  d.tasks.forEach(function (t) {
+    if (!Array.isArray(t.comments)) t.comments = [];
+    if (!Array.isArray(t.files)) t.files = [];
+  });
   return d;
 }
 function user(id) { return S.data.users.filter(function (u) { return u.id === id; })[0] || null; }
@@ -110,7 +116,7 @@ function ghHeaders(extra) {
   if (extra) Object.keys(extra).forEach(function (k) { hd[k] = extra[k]; });
   return hd;
 }
-function contentsUrl() { return API + '/repos/' + CFG.owner + '/' + CFG.repo + '/contents/' + CFG.path; }
+function contentsUrl(p) { return API + '/repos/' + CFG.owner + '/' + CFG.repo + '/contents/' + (p || CFG.path); }
 
 function readStatic() {
   return fetch('data/tasks.json?t=' + Date.now(), { cache: 'no-store' }).then(function (r) {
@@ -218,6 +224,104 @@ function fatal(msg) {
   $('board').replaceChildren(h('div', { class: 'empty' }, 'Не удалось загрузить задачи. ' + msg));
 }
 
+/* ---------- файлы ---------- */
+/* Файл кладется в репозиторий как files/<id>.bin: расширение всегда .bin, чтобы Pages
+   отдавал его как поток байтов и никогда не исполнял (html/js на общем домене github.io).
+   Настоящее имя хранится в tasks.json. */
+
+function okPath(p) { return typeof p === 'string' && /^files\/[a-z0-9]+\.bin$/.test(p); }
+function cleanName(n) { return String(n).replace(/[‪-‮⁦-⁩]/g, ''); }
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' Б';
+  if (n < 1048576) return Math.round(n / 1024) + ' КБ';
+  return (n / 1048576).toFixed(1).replace('.0', '').replace('.', ',') + ' МБ';
+}
+
+function readB64(file) {
+  return new Promise(function (resolve, reject) {
+    var r = new FileReader();
+    r.onload = function () { resolve(String(r.result).split(',')[1] || ''); };
+    r.onerror = function () { reject(new Error('не удалось прочитать файл «' + file.name + '»')); };
+    r.readAsDataURL(file);
+  });
+}
+
+function uploadFile(file) {
+  if (!S.canWrite) return Promise.reject(new Error('нет ключа доступа'));
+  if (!file.size) return Promise.reject(new Error('файл «' + file.name + '» пустой'));
+  if (file.size > MAX_FILE) return Promise.reject(new Error('файл «' + file.name + '» больше ' + fmtSize(MAX_FILE)));
+  var id = uid(), path = FILES_DIR + '/' + id + '.bin';
+  var who = meUser() ? meUser().name : '?';
+  return readB64(file).then(function (b64) {
+    var attempt = 0;
+    function go() {
+      var body = { message: who + ': файл «' + file.name.slice(0, 80) + '»', content: b64, branch: CFG.branch };
+      return fetch(contentsUrl(path), { method: 'PUT', headers: ghHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) }).then(function (r) {
+        if (r.ok) return { id: id, name: cleanName(file.name), size: file.size, path: path, by: S.me, at: nowIso() };
+        if ((r.status === 409 || r.status === 422) && ++attempt < 4) {
+          return new Promise(function (res) { setTimeout(res, 700 * attempt); }).then(go);
+        }
+        if (r.status === 401 || r.status === 403) { S.keyProblem = 'У ключа нет права записи. Нужно право Contents: Read and write.'; S.canWrite = false; render(); }
+        return r.json().then(function (j) { return j.message; }, function () { return ''; }).then(function (m) {
+          throw new Error(m || 'ошибка ' + r.status);
+        });
+      });
+    }
+    return go();
+  });
+}
+
+/* Грузит по очереди, возвращает уже загруженные и список ошибок. */
+function uploadAll(files, onEach) {
+  var metas = [], errors = [];
+  S.uploading++;
+  setSync();
+  return files.reduce(function (p, f) {
+    return p.then(function () {
+      return uploadFile(f).then(function (m) { metas.push(m); return onEach ? onEach(m) : null; },
+        function (e) { errors.push(errText(e)); });
+    });
+  }, Promise.resolve()).then(function () {
+    S.uploading--;
+    setSync();
+    return { metas: metas, errors: errors };
+  });
+}
+
+function deleteBlob(path, name) {
+  if (!S.canWrite || !okPath(path)) return Promise.resolve();
+  var who = meUser() ? meUser().name : '?';
+  return fetch(contentsUrl(path) + '?ref=' + CFG.branch, { headers: ghHeaders(), cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) {
+      if (!j || !j.sha) return;
+      return fetch(contentsUrl(path), { method: 'DELETE', headers: ghHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ message: who + ': удален файл «' + String(name).slice(0, 80) + '»', sha: j.sha, branch: CFG.branch }) });
+    })
+    .catch(function () { /* файл-сирота не страшен, задача уже обновлена */ });
+}
+
+function downloadFile(f, ev) {
+  if (!okPath(f.path)) { ev.preventDefault(); toast('Некорректная запись о файле', 'err'); return; }
+  if (!S.token || S.keyProblem) return; // без ключа работает обычная ссылка на Pages
+  ev.preventDefault();
+  fetch(contentsUrl(f.path) + '?ref=' + CFG.branch, { headers: ghHeaders({ Accept: 'application/vnd.github.raw+json' }), cache: 'no-store' })
+    .then(function (r) {
+      if (!r.ok) throw new Error('ошибка ' + r.status);
+      return r.blob();
+    })
+    .then(function (b) {
+      var url = URL.createObjectURL(b);
+      var a = h('a', { href: url, download: f.name });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 15000);
+    })
+    .catch(function (e) { toast('Не удалось скачать: ' + errText(e), 'err'); });
+}
+
 /* ---------- изменения ---------- */
 
 function patchTask(id, patch, msg) {
@@ -236,7 +340,7 @@ function patchTask(id, patch, msg) {
 function setSync() {
   var s = $('sync');
   s.className = 'sync';
-  if (S.saving > 0) s.textContent = 'Сохраняю...';
+  if (S.saving > 0 || S.uploading > 0) s.textContent = 'Сохраняю...';
   else if (S.error) { s.textContent = 'Нет связи'; s.className = 'sync err'; }
   else if (!S.canWrite) s.textContent = 'Только просмотр';
   else s.textContent = S.lastSync ? 'Сохранено, ' + pad(S.lastSync.getHours()) + ':' + pad(S.lastSync.getMinutes()) : '';
@@ -374,6 +478,7 @@ function taskRow(t) {
   meta.push(h('span', { class: 'chip' + (t.assignee ? '' : ' none') }, uname(t.assignee)));
   if (t.priority === 'high') meta.push(h('span', { class: 'chip high' }, 'Срочно'));
   if (t.due) meta.push(h('span', { class: 'due' + (t.status !== 'done' && t.due < today ? ' over' : '') }, 'до ' + fmtDue(t.due)));
+  if (t.files.length) meta.push(h('span', null, 'файлов ' + t.files.length));
   if (t.comments.length) meta.push(h('span', null, 'комм. ' + t.comments.length));
   return h('div', { class: 'task' + (t.status === 'done' ? ' is-done' : '') },
     sel,
@@ -453,7 +558,7 @@ function openTask(id, presetTheme) {
   if (isNew) {
     var thId = presetTheme || (d.themes[0] && d.themes[0].id);
     var th0 = theme(thId);
-    t = { theme: thId, title: '', desc: '', assignee: th0 ? th0.owner || null : null, status: 'new', priority: 'normal', due: null, comments: [] };
+    t = { theme: thId, title: '', desc: '', assignee: th0 ? th0.owner || null : null, status: 'new', priority: 'normal', due: null, comments: [], files: [] };
   } else {
     t = d.tasks.filter(function (x) { return x.id === id; })[0];
     if (!t) return;
@@ -482,6 +587,77 @@ function openTask(id, presetTheme) {
     if (!assSel.value || assSel.value === prevOwner || !admin) assSel.value = next && next.owner || '';
     origTheme = themeSel.value;
   });
+
+  var pending = [];
+  var fileBox = h('div', { class: 'files' });
+  function drawFiles() {
+    var cur = isNew ? t : (S.data.tasks.filter(function (x) { return x.id === id; })[0] || t);
+    var canAttach = isNew ? S.canWrite : (S.canWrite && editable);
+    var rows = [];
+    if (isNew) {
+      pending.forEach(function (f) {
+        rows.push(h('div', { class: 'frow' }, h('span', { class: 'fname' }, cleanName(f.name)), h('span', { class: 'hint' }, fmtSize(f.size) + ', загрузится при создании'),
+          h('button', { class: 'xbtn', type: 'button', 'aria-label': 'Убрать файл', onclick: function () { pending.splice(pending.indexOf(f), 1); drawFiles(); } }, '×')));
+      });
+    } else {
+      cur.files.forEach(function (f) {
+        var canRemove = S.canWrite && (admin || f.by === S.me);
+        rows.push(h('div', { class: 'frow' },
+          okPath(f.path)
+            ? h('a', { class: 'fname', href: f.path, download: cleanName(f.name), rel: 'noopener', onclick: function (ev) { downloadFile(f, ev); } }, cleanName(f.name))
+            : h('span', { class: 'fname' }, cleanName(f.name)),
+          h('span', { class: 'hint' }, fmtSize(f.size) + ', ' + uname(f.by) + ', ' + fmtStamp(f.at)),
+          canRemove ? h('button', { class: 'xbtn', type: 'button', 'aria-label': 'Удалить файл', onclick: function () { removeFile(f); } }, '×') : null));
+      });
+    }
+    var nodes = [h('div', { class: 'hint' }, rows.length ? 'Файлы' : 'Файлов пока нет')].concat(rows);
+    if (canAttach) {
+      var status = h('span', { class: 'hint' });
+      var inp = h('input', { type: 'file', multiple: true, 'aria-label': 'Прикрепить файлы',
+        onchange: function () {
+          var files = [].slice.call(inp.files);
+          inp.value = '';
+          if (!files.length) return;
+          if (isNew) {
+            files.forEach(function (f) {
+              if (f.size > MAX_FILE) toast('Файл «' + f.name + '» больше ' + fmtSize(MAX_FILE), 'err');
+              else if (!f.size) toast('Файл «' + f.name + '» пустой', 'err');
+              else pending.push(f);
+            });
+            drawFiles();
+            return;
+          }
+          inp.disabled = true;
+          status.textContent = 'Загружаю...';
+          uploadAll(files, function (m) {
+            return mutate(function (dd) {
+              var tt = dd.tasks.filter(function (x) { return x.id === id; })[0];
+              if (tt && !tt.files.some(function (x) { return x.id === m.id; })) tt.files.push(clone(m));
+            }, 'файл «' + m.name + '» к задаче «' + t.title + '»').then(function (ok) {
+              if (!ok) deleteBlob(m.path, m.name);
+              drawFiles();
+            });
+          }).then(function (res) {
+            if (res.errors.length) toast('Не загрузилось: ' + res.errors.join('; '), 'err');
+            drawFiles();
+          });
+        } });
+      nodes.push(h('div', { class: 'fadd' }, inp, status));
+      nodes.push(h('div', { class: 'hint warn' }, 'Файлы хранятся в публичном репозитории: их может скачать любой, у кого есть ссылка. Не прикрепляйте договоры, реквизиты, пароли. До ' + fmtSize(MAX_FILE) + ' на файл.'));
+    }
+    fileBox.replaceChildren.apply(fileBox, nodes);
+  }
+  function removeFile(f) {
+    if (!confirm('Удалить файл «' + f.name + '» из задачи?')) return;
+    mutate(function (dd) {
+      var tt = dd.tasks.filter(function (x) { return x.id === id; })[0];
+      if (tt) tt.files = tt.files.filter(function (x) { return x.id !== f.id; });
+    }, 'удален файл «' + f.name + '» из задачи «' + t.title + '»').then(function (ok) {
+      if (ok) deleteBlob(f.path, f.name);
+      drawFiles();
+    });
+    drawFiles();
+  }
 
   var cmBox = h('div', { class: 'cm-list' });
   function drawComments() {
@@ -516,9 +692,17 @@ function openTask(id, presetTheme) {
     if (!vals.title) { err.textContent = 'Напишите название задачи.'; title.focus(); return; }
     if (isNew) {
       if (!admin) { var th = theme(vals.theme); vals.assignee = th && th.owner || null; }
-      var task = Object.assign({ id: uid(), author: S.me, created: nowIso(), updated: nowIso(), closed: vals.status === 'done' ? nowIso() : null, comments: [] }, vals);
+      var task = Object.assign({ id: uid(), author: S.me, created: nowIso(), updated: nowIso(), closed: vals.status === 'done' ? nowIso() : null, comments: [], files: [] }, vals);
       closeDlg();
-      mutate(function (dd) { dd.tasks.push(clone(task)); }, 'новая задача «' + vals.title + '»');
+      if (!pending.length) { mutate(function (dd) { dd.tasks.push(clone(task)); }, 'новая задача «' + vals.title + '»'); return; }
+      toast('Загружаю файлы (' + pending.length + ')...');
+      uploadAll(pending).then(function (res) {
+        task.files = res.metas;
+        if (res.errors.length) toast('Не загрузилось: ' + res.errors.join('; '), 'err');
+        return mutate(function (dd) { dd.tasks.push(clone(task)); }, 'новая задача «' + vals.title + '»').then(function (ok) {
+          if (!ok) res.metas.forEach(function (m) { deleteBlob(m.path, m.name); });
+        });
+      });
       return;
     }
     var patch = {};
@@ -531,7 +715,15 @@ function openTask(id, presetTheme) {
     (!isNew && admin && S.canWrite) ? h('button', { class: 'btn danger left', type: 'button', onclick: function () {
       if (!confirm('Удалить задачу «' + t.title + '»? Это нельзя отменить со страницы.')) return;
       closeDlg();
-      mutate(function (dd) { dd.tasks = dd.tasks.filter(function (x) { return x.id !== id; }); }, 'удалена задача «' + t.title + '»');
+      var gone = [];
+      mutate(function (dd) {
+        var tt = dd.tasks.filter(function (x) { return x.id === id; })[0];
+        gone = tt ? tt.files.slice() : gone;
+        dd.tasks = dd.tasks.filter(function (x) { return x.id !== id; });
+      }, 'удалена задача «' + t.title + '»').then(function (ok) {
+        if (!ok) return;
+        gone.reduce(function (p, f) { return p.then(function () { return deleteBlob(f.path, f.name); }); }, Promise.resolve());
+      });
     } }, 'Удалить') : null,
     h('button', { class: 'btn', type: 'button', onclick: closeDlg }, 'Закрыть'),
     editable ? save : null);
@@ -546,8 +738,9 @@ function openTask(id, presetTheme) {
     h('div', { class: 'row2' }, field('Тематика', themeSel), assField),
     h('div', { class: 'row2' }, field('Статус', statSel), field('Приоритет', prioSel)),
     field('Срок', due),
-    info, err, btns, cmBox
+    fileBox, info, err, btns, cmBox
   ]);
+  drawFiles();
   drawComments();
   if (isNew) title.focus();
 }
@@ -634,6 +827,9 @@ function init() {
   dlg.addEventListener('click', function (e) { if (e.target === dlg && downOnBackdrop && !dlgLocked) closeDlg(); });
   dlg.addEventListener('cancel', function (e) { if (dlgLocked) e.preventDefault(); });
   dlg.addEventListener('close', function () { if (S.data && !meUser()) openWho(); });
+  window.addEventListener('beforeunload', function (e) {
+    if (S.saving > 0 || S.uploading > 0) { e.preventDefault(); e.returnValue = ''; }
+  });
   $('keyBtn').addEventListener('click', openKey);
   $('me').addEventListener('change', function () { setMe(this.value); });
   buildToolbar();
