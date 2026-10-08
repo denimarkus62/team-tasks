@@ -613,7 +613,7 @@ function openTask(id, presetTheme) {
     var nodes = [h('div', { class: 'hint' }, rows.length ? 'Файлы' : 'Файлов пока нет')].concat(rows);
     if (canAttach) {
       var status = h('span', { class: 'hint' });
-      var inp = h('input', { type: 'file', multiple: true, 'aria-label': 'Прикрепить файлы',
+      var inp = h('input', { type: 'file', multiple: true, class: 'sr',
         onchange: function () {
           var files = [].slice.call(inp.files);
           inp.value = '';
@@ -642,8 +642,12 @@ function openTask(id, presetTheme) {
             drawFiles();
           });
         } });
-      nodes.push(h('div', { class: 'fadd' }, inp, status));
+      nodes.push(h('div', { class: 'fadd' }, h('label', { class: 'btn fbtn' }, inp, 'Прикрепить файл'), status));
       nodes.push(h('div', { class: 'hint warn' }, 'Файлы хранятся в публичном репозитории: их может скачать любой, у кого есть ссылка. Не прикрепляйте договоры, реквизиты, пароли. До ' + fmtSize(MAX_FILE) + ' на файл.'));
+    } else {
+      nodes.push(h('div', { class: 'hint warn' }, !S.canWrite
+        ? 'Чтобы прикреплять файлы, введите ключ доступа: кнопка «Ввести ключ» вверху страницы.'
+        : 'Прикреплять файлы к этой задаче могут Роман, исполнитель и автор.'));
     }
     fileBox.replaceChildren.apply(fileBox, nodes);
   }
@@ -735,10 +739,11 @@ function openTask(id, presetTheme) {
     h('h3', null, isNew ? 'Новая задача' : 'Задача'),
     field('Название', title),
     field('Описание', desc),
+    fileBox,
     h('div', { class: 'row2' }, field('Тематика', themeSel), assField),
     h('div', { class: 'row2' }, field('Статус', statSel), field('Приоритет', prioSel)),
     field('Срок', due),
-    fileBox, info, err, btns, cmBox
+    info, err, btns, cmBox
   ]);
   drawFiles();
   drawComments();

@@ -149,7 +149,9 @@ dialog::backdrop { background: rgba(10, 14, 22, .5); }
 .frow .fname { overflow-wrap: anywhere; color: var(--st-progress); }
 .frow span.fname { color: var(--text); }
 .fadd { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
-.fadd input[type=file] { max-width: 100%; }
+.sr { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+.fbtn { display: inline-flex; align-items: center; position: relative; }
+.fbtn:focus-within { outline: 2px solid var(--st-progress); outline-offset: 1px; }
 .hint.warn { color: var(--warn); margin-top: 6px; }
 .cm-list { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
 .cm { margin-bottom: 10px; font-size: 14px; }
